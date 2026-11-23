@@ -17,6 +17,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    buildFeatures { aidl = true }
 }
 dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")

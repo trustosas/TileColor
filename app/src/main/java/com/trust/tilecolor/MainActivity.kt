@@ -1,6 +1,8 @@
 package com.trust.tilecolor
 
 import android.app.Activity
+import android.content.ComponentName
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
@@ -11,29 +13,29 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import org.lsposed.hiddenapibypass.HiddenApiBypass
 import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuBinderWrapper
-import rikka.shizuku.SystemServiceHelper
-import java.lang.reflect.InvocationTargetException
 
 class MainActivity : Activity() {
 
-    companion object {
-        // Overlay owner must match the calling package of the Shizuku shell process.
-        private const val OWNER = "com.android.shell"
-        private const val NAME = "tilecolor"
-        private const val TARGET = "com.android.systemui"
-        private val RESOURCES = listOf(
-            "ts_icon_bg_color_active",
-            "ts_icon_bg_color_active_light",
-            "resident_tile_board_active_color_solid",
-            "tr_qs_icon_foreground_color_active",
-        )
-    }
-
     private lateinit var log: TextView
     private lateinit var hex: EditText
+    private var service: IOverlayService? = null
+    private var pending: ((IOverlayService) -> Unit)? = null
+
+    private val args by lazy {
+        Shizuku.UserServiceArgs(ComponentName(packageName, OverlayService::class.java.name))
+            .daemon(false).processNameSuffix("overlay").debuggable(false).version(1)
+    }
+
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (binder == null || !binder.pingBinder()) { say("Service binder invalid"); return }
+            val s = IOverlayService.Stub.asInterface(binder)
+            service = s
+            pending?.let { pending = null; it(s) }
+        }
+        override fun onServiceDisconnected(name: ComponentName?) { service = null }
+    }
 
     private val permListener = Shizuku.OnRequestPermissionResultListener { _, result ->
         say(if (result == PackageManager.PERMISSION_GRANTED) "Shizuku permission granted" else "Shizuku permission denied")
@@ -41,7 +43,6 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        HiddenApiBypass.addHiddenApiExemptions("L")
         Shizuku.addRequestPermissionResultListener(permListener)
 
         val pad = (16 * resources.displayMetrics.density).toInt()
@@ -59,8 +60,8 @@ class MainActivity : Activity() {
         root.addView(TextView(this).apply { text = "Active tile color (hex RRGGBB)" })
         root.addView(hex)
         button("Grant Shizuku permission") { grant() }
-        button("Apply") { run { apply(true) } }
-        button("Revert") { run { apply(false) } }
+        button("Apply") { call(true) }
+        button("Revert") { call(false) }
         root.addView(log)
         setContentView(ScrollView(this).apply { addView(root) })
         say(status())
@@ -68,10 +69,11 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         Shizuku.removeRequestPermissionResultListener(permListener)
+        try { Shizuku.unbindUserService(args, conn, false) } catch (_: Throwable) {}
         super.onDestroy()
     }
 
-    private fun say(s: String) { log.append(s + "\n") }
+    private fun say(s: String) = runOnUiThread { log.append(s + "\n") }
 
     private fun status(): String = when {
         !Shizuku.pingBinder() -> "Shizuku is not running. Start it first."
@@ -85,55 +87,22 @@ class MainActivity : Activity() {
         else Shizuku.requestPermission(1)
     }
 
-    private fun run(block: () -> Unit) {
-        try {
-            if (!Shizuku.pingBinder() || Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                say(status()); return
-            }
-            block()
-        } catch (e: InvocationTargetException) {
-            say("Failed: " + (e.targetException?.toString() ?: e.toString()))
-        } catch (e: Throwable) {
-            say("Failed: $e")
+    private fun call(enable: Boolean) {
+        if (!Shizuku.pingBinder() || Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            say(status()); return
         }
-    }
-
-    private fun overlayManager(): Any {
-        val wrapped = ShizukuBinderWrapper(SystemServiceHelper.getSystemService("overlay"))
-        return Class.forName("android.content.om.IOverlayManager\$Stub")
-            .getMethod("asInterface", IBinder::class.java)
-            .invoke(null, wrapped)!!
-    }
-
-    private fun apply(enable: Boolean) {
-        val idCls = Class.forName("android.content.om.OverlayIdentifier")
-        val txCls = Class.forName("android.content.om.OverlayManagerTransaction")
-        val txBuilderCls = Class.forName("android.content.om.OverlayManagerTransaction\$Builder")
-        val id = idCls.getConstructor(String::class.java, String::class.java).newInstance(OWNER, NAME)
-        val tx = txBuilderCls.getConstructor().newInstance()
-
-        if (enable) {
-            val color = Color.parseColor("#" + hex.text.toString().trim().removePrefix("#"))
-            val fabCls = Class.forName("android.content.om.FabricatedOverlay")
-            val fabBuilderCls = Class.forName("android.content.om.FabricatedOverlay\$Builder")
-            val fb = fabBuilderCls.getConstructor(String::class.java, String::class.java, String::class.java)
-                .newInstance(OWNER, NAME, TARGET)
-            val setValue = fabBuilderCls.getMethod(
-                "setResourceValue", String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
-            )
-            for (r in RESOURCES) setValue.invoke(fb, "$TARGET:color/$r", TypedValue.TYPE_INT_COLOR_ARGB8, color)
-            val overlay = fabBuilderCls.getMethod("build").invoke(fb)
-            txBuilderCls.getMethod("registerFabricatedOverlay", fabCls).invoke(tx, overlay)
-            txBuilderCls.getMethod("setEnabled", idCls, Boolean::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                .invoke(tx, id, true, 0)
-        } else {
-            txBuilderCls.getMethod("unregisterFabricatedOverlay", idCls).invoke(tx, id)
+        val color = try {
+            Color.parseColor("#" + hex.text.toString().trim().removePrefix("#"))
+        } catch (e: Throwable) { say("Bad hex color"); return }
+        val action: (IOverlayService) -> Unit = { s ->
+            Thread { say(try { s.apply(enable, color) } catch (e: Throwable) { "Failed: $e" }) }.start()
         }
-
-        val built = txBuilderCls.getMethod("build").invoke(tx)
-        Class.forName("android.content.om.IOverlayManager")
-            .getMethod("commit", txCls)
-            .invoke(overlayManager(), built)
-        say(if (enable) "Applied. Open the shade; if unchanged run: killall com.android.systemui" else "Reverted.")
+        val s = service
+        if (s != null && s.asBinder().pingBinder()) action(s)
+        else {
+            pending = action
+            say("Starting Shizuku service...")
+            try { Shizuku.bindUserService(args, conn) } catch (e: Throwable) { say("Bind failed: $e") }
+        }
     }
 }
